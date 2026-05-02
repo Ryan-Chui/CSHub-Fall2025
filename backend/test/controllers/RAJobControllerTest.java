@@ -1,0 +1,230 @@
+package controllers;
+
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import models.Mail;
+import models.RAJob;
+import models.RAJobApplication;
+import models.User;
+import org.junit.Test;
+import play.Application;
+import play.libs.Json;
+import play.mvc.Http;
+import play.mvc.Result;
+import play.test.WithApplication;
+import support.RAJobTestHelper;
+
+import java.util.List;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
+import static play.mvc.Http.Status.BAD_REQUEST;
+import static play.mvc.Http.Status.NOT_FOUND;
+import static play.mvc.Http.Status.OK;
+import static play.test.Helpers.GET;
+import static play.test.Helpers.POST;
+import static play.test.Helpers.contentAsString;
+import static play.test.Helpers.route;
+
+public class RAJobControllerTest extends WithApplication {
+
+    @Override
+    protected Application provideApplication() {
+        return play.test.Helpers.fakeApplication(RAJobTestHelper.buildBackendTestConfig("play-rajob-controller"));
+    }
+
+    @org.junit.Before
+    public void setUpSchema() {
+        RAJobTestHelper.resetSchema();
+    }
+
+    @Test
+    public void giveRAJobOffertoStudentPersistsInterviewSlots() {
+        RAJobApplication application = seedRAJobApplication();
+
+        ObjectNode payload = Json.newObject();
+        payload.put("status", "pending");
+        payload.put("interviewSlot1", "2026-05-01T10:00");
+        payload.put("interviewSlot2", "");
+        payload.put("interviewSlot3", "2026-05-02T14:30");
+
+        Http.RequestBuilder request = new Http.RequestBuilder()
+                .method(POST)
+                .uri("/rajob/updateRAjobApplicationStatus/" + application.getId())
+                .bodyJson(payload);
+
+        Result result = route(app, request);
+        assertThat(result).isNotNull();
+        assertThat(result.status()).isEqualTo(OK);
+
+        RAJobApplication updated = RAJobApplication.find.byId(application.getId());
+        assertThat(updated.getStatus()).isEqualTo("pending");
+        assertThat(updated.getInterviewSlot1()).isEqualTo("2026-05-01T10:00");
+        assertThat(updated.getInterviewSlot2()).isNull();
+        assertThat(updated.getInterviewSlot3()).isEqualTo("2026-05-02T14:30");
+    }
+
+    @Test
+    public void giveRAJobOffertoStudentRequiresStatusField() {
+        RAJobApplication application = seedRAJobApplication();
+
+        ObjectNode payload = Json.newObject();
+        payload.put("interviewSlot1", "2026-05-01T10:00");
+
+        Http.RequestBuilder request = new Http.RequestBuilder()
+                .method(POST)
+                .uri("/rajob/updateRAjobApplicationStatus/" + application.getId())
+                .bodyJson(payload);
+
+        Result result = route(app, request);
+        assertThat(result).isNotNull();
+        assertThat(result.status()).isEqualTo(BAD_REQUEST);
+    }
+
+    @Test
+    public void giveRAJobOffertoStudentReturnsNotFoundForMissingApplication() {
+        ObjectNode payload = Json.newObject();
+        payload.put("status", "pending");
+
+        Http.RequestBuilder request = new Http.RequestBuilder()
+                .method(POST)
+                .uri("/rajob/updateRAjobApplicationStatus/999999")
+                .bodyJson(payload);
+
+        Result result = route(app, request);
+        assertThat(result).isNotNull();
+        assertThat(result.status()).isEqualTo(NOT_FOUND);
+    }
+
+    @Test
+    public void giveRAJobOffertoStudentTrimsAndNormalizesInterviewSlots() {
+        RAJobApplication application = seedRAJobApplication();
+
+        ObjectNode payload = Json.newObject();
+        payload.put("status", "pending");
+        payload.put("interviewSlot1", "   2026-05-01T10:00   ");
+        payload.put("interviewSlot2", "   ");
+        payload.put("interviewSlot3", "\n\t");
+
+        Http.RequestBuilder request = new Http.RequestBuilder()
+                .method(POST)
+                .uri("/rajob/updateRAjobApplicationStatus/" + application.getId())
+                .bodyJson(payload);
+
+        Result result = route(app, request);
+        assertThat(result).isNotNull();
+        assertThat(result.status()).isEqualTo(OK);
+
+        RAJobApplication updated = RAJobApplication.find.byId(application.getId());
+        assertThat(updated.getInterviewSlot1()).isEqualTo("2026-05-01T10:00");
+        assertThat(updated.getInterviewSlot2()).isNull();
+        assertThat(updated.getInterviewSlot3()).isNull();
+    }
+
+    @Test
+    public void facultyCalendarReturnsScheduledInterviewsForFacultyJobs() {
+        RAJobApplication application = seedRAJobApplication();
+        application.setStatus("pending");
+        application.setInterviewSlot1("2026-05-01T10:00");
+        application.update();
+
+        Http.RequestBuilder request = new Http.RequestBuilder()
+                .method(GET)
+                .uri("/rajob/interviewCalendar/" + application.getAppliedRAJob().getRajobPublisher().getId());
+
+        Result result = route(app, request);
+        assertThat(result).isNotNull();
+        assertThat(result.status()).isEqualTo(OK);
+        assertThat(contentAsString(result)).contains("RA Position");
+        assertThat(contentAsString(result)).contains("student@example.com");
+        assertThat(contentAsString(result)).contains("2026-05-01T10:00");
+    }
+
+    @Test
+    public void rescheduleRAInterviewUpdatesStatusAndInterviewTime() {
+        RAJobApplication application = seedRAJobApplication();
+        application.setStatus("pending");
+        application.setInterviewSlot1("2026-05-01T10:00");
+        application.update();
+
+        ObjectNode payload = Json.newObject();
+        payload.put("interviewTime", "2026-05-03T09:15");
+        payload.put("note", "Please use the Teams link from the original message.");
+
+        Http.RequestBuilder request = new Http.RequestBuilder()
+                .method(POST)
+                .uri("/rajob/interview/" + application.getId() + "/reschedule")
+                .bodyJson(payload);
+
+        Result result = route(app, request);
+        assertThat(result).isNotNull();
+        assertThat(result.status()).isEqualTo(OK);
+
+        RAJobApplication updated = RAJobApplication.find.byId(application.getId());
+        assertThat(updated.getStatus()).isEqualTo("rescheduled");
+        assertThat(updated.getInterviewSlot1()).isEqualTo("2026-05-03T09:15");
+        assertThat(updated.getInterviewSlot2()).isNull();
+        assertThat(updated.getInterviewSlot3()).isNull();
+    }
+
+    @Test
+    public void cancelRAInterviewUpdatesStatus() {
+        RAJobApplication application = seedRAJobApplication();
+        application.setStatus("pending");
+        application.setInterviewSlot1("2026-05-01T10:00");
+        application.update();
+
+        ObjectNode payload = Json.newObject();
+        payload.put("note", "Position has been filled.");
+
+        Http.RequestBuilder request = new Http.RequestBuilder()
+                .method(POST)
+                .uri("/rajob/interview/" + application.getId() + "/cancel")
+                .bodyJson(payload);
+
+        Result result = route(app, request);
+        assertThat(result).isNotNull();
+        assertThat(result.status()).isEqualTo(OK);
+
+        RAJobApplication updated = RAJobApplication.find.byId(application.getId());
+        assertThat(updated.getStatus()).isEqualTo("canceled");
+        assertThat(updated.getInterviewSlot1()).isEqualTo("2026-05-01T10:00");
+    }
+
+    private RAJobApplication seedRAJobApplication() {
+        User publisher = new User();
+        publisher.setUserName("facultyUser");
+        publisher.setEmail("faculty@example.com");
+        publisher.setPassword("password");
+        publisher.setIsActive("True");
+        publisher.setLevel("normal");
+        publisher.save();
+
+        User applicant = new User();
+        applicant.setUserName("studentUser");
+        applicant.setEmail("student@example.com");
+        applicant.setPassword("password");
+        applicant.setIsActive("True");
+        applicant.setLevel("normal");
+        applicant.save();
+
+        RAJob rajob = new RAJob();
+        rajob.setTitle("RA Position");
+        rajob.setStatus("open");
+        rajob.setIsActive("True");
+        rajob.setCreateTime("now");
+        rajob.setUpdateTime("now");
+        rajob.setRajobPublisher(publisher);
+        rajob.save();
+
+        RAJobApplication application = new RAJobApplication();
+        application.setAppliedRAJob(rajob);
+        application.setApplicant(applicant);
+        application.setStatus("open");
+        application.setIsActive("True");
+        application.setCreatedTime("now");
+        application.save();
+        return application;
+    }
+}

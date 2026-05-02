@@ -17,20 +17,22 @@ import play.Logger;
 import play.libs.Json;
 import play.mvc.Controller;
 import play.mvc.Result;
+import services.PushNotificationService;
 import services.RAJobService;
 import utils.Common;
 import utils.EmailUtils;
+import utils.InterviewSlotUtils;
 
 import javax.inject.Inject;
 import javax.mail.MessagingException;
 import java.io.UnsupportedEncodingException;
 import java.util.*;
+import java.util.stream.Collectors;
 
 import static utils.Constants.*;
 
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
-import java.util.stream.Collectors;
 
 public class RAJobController extends Controller {
     public static final String RAJOB_DEFAULT_SORT_CRITERIA = "title";
@@ -38,13 +40,15 @@ public class RAJobController extends Controller {
     public static final String RAJOB_IMAGE_KEY = "jobImage-";
 
     private final RAJobService rajobService;
+    private final PushNotificationService pushNotificationService;
 
     @Inject
     Config config;
 
     @Inject
-    public RAJobController(RAJobService rajobService) {
+    public RAJobController(RAJobService rajobService, PushNotificationService pushNotificationService) {
         this.rajobService = rajobService;
+        this.pushNotificationService = pushNotificationService;
     }
 
     /************************************************* Add RAJob *******************************************************/
@@ -62,7 +66,13 @@ public class RAJobController extends Controller {
             }
 
             RAJob rajob = Json.fromJson(json, RAJob.class);
-            System.out.println("<<<<,,1.1 rajob to create:" + rajob.toString());
+            User publisher = resolveRAJobPublisher(json, rajob);
+            if (publisher == null) {
+                Logger.warn("RA job not saved: invalid publisher payload {}", json.path("rajobPublisher"));
+                return Common.badRequestWrapper("RA job not saved: invalid publisher.");
+            }
+            rajob.setRajobPublisher(publisher);
+
             rajob.setIsActive("True");
             rajob.setStatus("open");
             rajob.setCreateTime(new Date().toString());
@@ -75,8 +85,8 @@ public class RAJobController extends Controller {
 
             return ok(Json.toJson(rajob.getId()).toString());
         } catch (Exception e) {
-            Logger.debug("RA job cannot be added: " + e.toString());
-            return badRequest("RA job not saved: ");
+            Logger.error("RA job cannot be added", e);
+            return Common.badRequestWrapper("RA job not saved: " + e.getMessage());
         }
     }
     /************************************************* End of Add RAJob ************************************************/
@@ -139,8 +149,14 @@ public class RAJobController extends Controller {
             }
             System.out.println("Status update to: " + json.get("status").asText());
             rajobApplication.setStatus(json.get("status").asText());
+            rajobApplication.setInterviewSlot1(InterviewSlotUtils.sanitizeOptionalText(json.path("interviewSlot1").asText(null)));
+            rajobApplication.setInterviewSlot2(InterviewSlotUtils.sanitizeOptionalText(json.path("interviewSlot2").asText(null)));
+            rajobApplication.setInterviewSlot3(InterviewSlotUtils.sanitizeOptionalText(json.path("interviewSlot3").asText(null)));
             rajobApplication.update();
-            return ok(Json.toJson(rajobApplication));
+            if (pushNotificationService.hasInterviewSlots(rajobApplication)) {
+                pushNotificationService.createFacultyInterviewSlotNotification(rajobApplication);
+            }
+            return ok(buildRAJobApplicationResponse(rajobApplication));
         } catch (Exception e) {
             Logger.debug("Error updating RAJobApplication with id: " + rajobApplicationId + " - " + e.toString());
             e.printStackTrace();
@@ -473,6 +489,137 @@ public class RAJobController extends Controller {
         } catch (Exception e) {
             Logger.debug("RAJobController.getRAJobsByPublisher exception: " + e.toString());
             return internalServerError("RAJobController.getRAJobsByPublisher exception: " + e.toString());
+        }
+    }
+
+    public Result getRAInterviewCalendar(Long facultyId) {
+        try {
+            if (facultyId == null) {
+                return Common.badRequestWrapper("facultyId is null or empty.");
+            }
+
+            List<RAJobApplication> applications = RAJobApplication.find.query()
+                    .where().eq("appliedRAJob.rajobPublisher.id", facultyId)
+                    .findList();
+
+            ArrayNode calendar = Json.newArray();
+            for (RAJobApplication application : applications) {
+                if (!hasInterviewTime(application) || isCanceledInterview(application)) {
+                    continue;
+                }
+                calendar.add(buildInterviewCalendarJson(application));
+            }
+
+            List<JsonNode> sorted = new ArrayList<>();
+            calendar.forEach(sorted::add);
+            sorted.sort(Comparator.comparing(node -> node.path("interviewTime").asText("")));
+
+            ArrayNode sortedCalendar = Json.newArray();
+            sorted.forEach(sortedCalendar::add);
+            return ok(sortedCalendar);
+        } catch (Exception e) {
+            Logger.debug("RAJobController.getRAInterviewCalendar exception: " + e.toString());
+            return internalServerError("RAJobController.getRAInterviewCalendar exception: " + e.toString());
+        }
+    }
+
+    public Result rescheduleRAInterview(Long rajobApplicationId) {
+        return updateInterviewSchedule(rajobApplicationId, "rescheduled");
+    }
+
+    public Result cancelRAInterview(Long rajobApplicationId) {
+        return updateInterviewSchedule(rajobApplicationId, "canceled");
+    }
+
+    private Result updateInterviewSchedule(Long rajobApplicationId, String newStatus) {
+        try {
+            JsonNode json = request().body().asJson();
+            if (json == null) {
+                return badRequest("Interview update expects Json data.");
+            }
+
+            RAJobApplication application = RAJobApplication.find.byId(rajobApplicationId);
+            if (application == null) {
+                return notFound("RAJobApplication not found.");
+            }
+
+            String note = InterviewSlotUtils.sanitizeOptionalText(json.path("note").asText(null));
+            if ("rescheduled".equals(newStatus)) {
+                String interviewTime = InterviewSlotUtils.sanitizeOptionalText(json.path("interviewTime").asText(null));
+                if (interviewTime == null) {
+                    return badRequest("interviewTime is required for rescheduling.");
+                }
+                application.setInterviewSlot1(interviewTime);
+                application.setInterviewSlot2(null);
+                application.setInterviewSlot3(null);
+            }
+
+            application.setStatus(newStatus);
+            application.update();
+
+            boolean notificationSent = notifyStudentInterviewChanged(application, newStatus, note);
+            ObjectNode response = buildInterviewCalendarJson(application);
+            response.put("notificationSent", notificationSent);
+            return ok(response);
+        } catch (Exception e) {
+            Logger.debug("RAJobController.updateInterviewSchedule exception: " + e.toString());
+            return internalServerError("RAJobController.updateInterviewSchedule exception: " + e.toString());
+        }
+    }
+
+    private boolean hasInterviewTime(RAJobApplication application) {
+        return firstInterviewTime(application) != null;
+    }
+
+    private boolean isCanceledInterview(RAJobApplication application) {
+        return application.getStatus() != null && application.getStatus().equalsIgnoreCase("canceled");
+    }
+
+    private String firstInterviewTime(RAJobApplication application) {
+        String slot1 = InterviewSlotUtils.sanitizeOptionalText(application.getInterviewSlot1());
+        if (slot1 != null) return slot1;
+        String slot2 = InterviewSlotUtils.sanitizeOptionalText(application.getInterviewSlot2());
+        if (slot2 != null) return slot2;
+        return InterviewSlotUtils.sanitizeOptionalText(application.getInterviewSlot3());
+    }
+
+    private ObjectNode buildInterviewCalendarJson(RAJobApplication application) {
+        ObjectNode row = Json.newObject();
+        RAJob rajob = application.getAppliedRAJob();
+        User applicant = application.getApplicant();
+
+        row.put("applicationId", application.getId());
+        row.put("rajobId", rajob != null ? rajob.getId() : 0L);
+        row.put("rajobTitle", rajob != null ? rajob.getTitle() : "");
+        row.put("studentName", applicant != null ? applicant.getUserName() : "");
+        row.put("studentEmail", applicant != null ? applicant.getEmail() : "");
+        row.put("interviewTime", firstInterviewTime(application));
+        row.put("status", application.getStatus());
+        return row;
+    }
+
+    private boolean notifyStudentInterviewChanged(RAJobApplication application, String status, String note) {
+        User applicant = application.getApplicant();
+        RAJob rajob = application.getAppliedRAJob();
+        if (applicant == null || applicant.getEmail() == null || applicant.getEmail().trim().isEmpty()) {
+            Logger.warn("Interview update notification skipped because applicant email is missing.");
+            return false;
+        }
+
+        String jobTitle = rajob != null ? rajob.getTitle() : "RA position";
+        String subject = "No-reply: RA Interview " + ("canceled".equals(status) ? "Canceled" : "Rescheduled");
+        String body = "Dear Applicant,\n\n"
+                + "Your interview for \"" + jobTitle + "\" has been " + status + ".\n"
+                + ("canceled".equals(status) ? "" : "New interview time: " + firstInterviewTime(application) + "\n")
+                + (note == null ? "" : "Note: " + note + "\n")
+                + "\nBest Regards,\nSMU-Lyle-Sci-Hub Group";
+
+        try {
+            EmailUtils.sendIndividualEmail(config, applicant.getEmail(), subject, body);
+            return true;
+        } catch (Exception e) {
+            Logger.error("Interview update email failed for application " + application.getId(), e);
+            return false;
         }
     }
 
@@ -877,34 +1024,42 @@ public class RAJobController extends Controller {
         Logger.info("sendOfferEmail: Received parameters - rajobApplicationId: " + rajobApplicationId);
 
         RAJobApplication thisApplication = RAJobApplication.find.byId(Long.parseLong(rajobApplicationId));
+        if (thisApplication == null) {
+            Logger.error("sendOfferEmail: No application found with id: " + rajobApplicationId);
+            return badRequest("RA job application not found");
+        }
+
+        thisApplication.setInterviewSlot1(InterviewSlotUtils.sanitizeOptionalText(
+                json.path("interviewSlot1").asText(thisApplication.getInterviewSlot1())));
+        thisApplication.setInterviewSlot2(InterviewSlotUtils.sanitizeOptionalText(
+                json.path("interviewSlot2").asText(thisApplication.getInterviewSlot2())));
+        thisApplication.setInterviewSlot3(InterviewSlotUtils.sanitizeOptionalText(
+                json.path("interviewSlot3").asText(thisApplication.getInterviewSlot3())));
+        thisApplication.update();
 
         Long rajobId = thisApplication.getAppliedRAJob().getId();
-        Long recipientId = thisApplication.getApplicant().getId();
 
         RAJob thisRajob = RAJob.find.byId(rajobId);
-        User thisRecipient = User.find.byId(recipientId);
+        User thisRecipient = pushNotificationService.getNotificationRecipient(thisApplication);
 
         if (thisRajob == null) {
             Logger.error("sendOfferEmail: No rajob found with id: " + rajobId);
-            return badRequest("User not found");
+            return badRequest("RA job not found");
         }
         if (thisRecipient == null) {
-            Logger.error("sendOfferEmail: No user found with id: " + recipientId);
+            Logger.error("sendOfferEmail: No user found for application id: " + rajobApplicationId);
             return badRequest("User not found");
         }
 
-        String position = thisRajob.getTitle();
         String email = thisRecipient.getEmail();
-
-        String body = "Dear Applicant,\n\n"
-                + "Your application for Position " + position + " has been reviewed and approved by the professor. Please reach out to the professor within five working days to discuss the details of the position.\n\n"
-                + "This position will be reserved for you for five days. After that period, it will be made available to the public again.\n\n"
-                + "Thank you for your interest. We look forward to your response.\n\n"
-                + "Best Regards, \n\n"
-                + "SMU-Lyle-Sci-Hub Group";
+        String subject = pushNotificationService.buildFacultyOfferSubject(thisRajob.getTitle());
+        String body = pushNotificationService.buildFacultyOfferBody(
+                thisRajob.getTitle(),
+                thisApplication.getInterviewSlot1(),
+                thisApplication.getInterviewSlot2(),
+                thisApplication.getInterviewSlot3()
+        );
         Logger.info("sendOfferEmail: Email body constructed: " + body);
-
-        String subject = "No-reply: Your [" + position + "] Application Has Been Approved";
 
         try {
             // Send individual mail.
@@ -1054,5 +1209,93 @@ public class RAJobController extends Controller {
                 .collect(Collectors.toList());
 
         return ok(Json.toJson(professors));
+    }
+
+    private ObjectNode buildRAJobApplicationResponse(RAJobApplication rajobApplication) {
+        ObjectNode response = Json.newObject();
+        if (rajobApplication == null) {
+            return response;
+        }
+        response.put("id", rajobApplication.getId());
+        response.put("status", rajobApplication.getStatus());
+        response.put("interviewSlot1", rajobApplication.getInterviewSlot1());
+        response.put("interviewSlot2", rajobApplication.getInterviewSlot2());
+        response.put("interviewSlot3", rajobApplication.getInterviewSlot3());
+        return response;
+    }
+
+    private User resolveRAJobPublisher(JsonNode json, RAJob rajob) {
+        if (rajob != null && rajob.getRajobPublisher() != null && rajob.getRajobPublisher().getId() > 0) {
+            User existingUser = User.find.byId(rajob.getRajobPublisher().getId());
+            if (existingUser != null) {
+                return existingUser;
+            }
+        }
+
+        JsonNode publisherJson = json.path("rajobPublisher");
+        if (publisherJson == null || publisherJson.isMissingNode()) {
+            return null;
+        }
+
+        long publisherId = publisherJson.path("id").asLong(0L);
+        if (publisherId > 0) {
+            User existingUser = User.find.byId(publisherId);
+            if (existingUser != null) {
+                return existingUser;
+            }
+        }
+
+        String publisherEmail = publisherJson.path("email").asText("");
+        if (publisherEmail != null && !publisherEmail.trim().isEmpty()) {
+            User existingByEmail = User.find.query().where().eq("email", publisherEmail.trim()).findOne();
+            if (existingByEmail != null) {
+                return existingByEmail;
+            }
+        }
+
+        return createPlaceholderPublisher(publisherId, publisherEmail);
+    }
+
+    private User createPlaceholderPublisher(long requestedId, String requestedEmail) {
+        String email = requestedEmail == null ? "" : requestedEmail.trim();
+        if (email.isEmpty()) {
+            email = "faculty-" + (requestedId > 0 ? requestedId : System.currentTimeMillis()) + "@local.invalid";
+        }
+
+        try {
+            User placeholder = new User();
+            if (requestedId > 0) {
+                placeholder.setId(requestedId);
+            }
+
+            placeholder.setEmail(email);
+            placeholder.setUserName(email.contains("@") ? email.substring(0, email.indexOf('@')) : email);
+            placeholder.setPassword("");
+            placeholder.setFirstName("Faculty");
+            placeholder.setLastName("User");
+            placeholder.setLevel("normal");
+            placeholder.setIsActive("True");
+            placeholder.setCreateTime(new Date().toString());
+            placeholder.save();
+            return placeholder;
+        } catch (Exception ex) {
+            Logger.warn("Failed to create placeholder publisher with requested id, retrying with generated id. {}", ex.toString());
+            try {
+                User placeholder = new User();
+                placeholder.setEmail(email);
+                placeholder.setUserName(email.contains("@") ? email.substring(0, email.indexOf('@')) : email);
+                placeholder.setPassword("");
+                placeholder.setFirstName("Faculty");
+                placeholder.setLastName("User");
+                placeholder.setLevel("normal");
+                placeholder.setIsActive("True");
+                placeholder.setCreateTime(new Date().toString());
+                placeholder.save();
+                return placeholder;
+            } catch (Exception retryEx) {
+                Logger.error("Failed to create placeholder publisher for RA job", retryEx);
+                return null;
+            }
+        }
     }
 }

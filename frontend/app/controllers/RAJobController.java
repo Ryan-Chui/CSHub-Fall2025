@@ -363,6 +363,63 @@ public class RAJobController extends Controller {
 
     /************************************************** End of My Posted RAJob ******************************************/
 
+    @With(OperationLoggingAction.class)
+    public Result interviewCalendar() {
+        checkLoginStatus();
+        try {
+            String userId = session("id");
+            JsonNode interviews = RESTfulCalls.getAPI(RESTfulCalls.getBackendAPIUrl(config,
+                    "/rajob/interviewCalendar/" + userId));
+            if (interviews == null || interviews.has("error") || !interviews.isArray()) {
+                interviews = Json.newArray();
+            }
+            return ok(raInterviewCalendar.render(interviews));
+        } catch (Exception e) {
+            Logger.debug("RAJobController.interviewCalendar() exception: " + e.toString());
+            Application.flashMsg(RESTfulCalls.createUserResponse(RESTfulCalls.UserResponseType.GENERALERROR));
+            return ok(generalError.render());
+        }
+    }
+
+    public Result rescheduleInterview(Long rajobApplicationId) {
+        checkLoginStatus();
+        try {
+            Map<String, String[]> formData = request().body().asFormUrlEncoded();
+            ObjectNode payload = Json.newObject();
+            payload.put("interviewTime", sanitizeOptionalFormValue(formData, "interviewTime"));
+            payload.put("note", sanitizeOptionalFormValue(formData, "note"));
+
+            JsonNode response = RESTfulCalls.postAPI(RESTfulCalls.getBackendAPIUrl(config,
+                    "/rajob/interview/" + rajobApplicationId + "/reschedule"), payload);
+            if (response == null || response.has("error")) {
+                Logger.warn("Failed to reschedule RA interview application " + rajobApplicationId);
+            }
+            return redirect(routes.RAJobController.interviewCalendar());
+        } catch (Exception e) {
+            Logger.error("rescheduleInterview failed", e);
+            return ok(editError.render("RA Interview"));
+        }
+    }
+
+    public Result cancelInterview(Long rajobApplicationId) {
+        checkLoginStatus();
+        try {
+            Map<String, String[]> formData = request().body().asFormUrlEncoded();
+            ObjectNode payload = Json.newObject();
+            payload.put("note", sanitizeOptionalFormValue(formData, "note"));
+
+            JsonNode response = RESTfulCalls.postAPI(RESTfulCalls.getBackendAPIUrl(config,
+                    "/rajob/interview/" + rajobApplicationId + "/cancel"), payload);
+            if (response == null || response.has("error")) {
+                Logger.warn("Failed to cancel RA interview application " + rajobApplicationId);
+            }
+            return redirect(routes.RAJobController.interviewCalendar());
+        } catch (Exception e) {
+            Logger.error("cancelInterview failed", e);
+            return ok(editError.render("RA Interview"));
+        }
+    }
+
     /************************************************** My Applied RAJob *************************************************/
     /**
      * get all ra jobs applied by user
@@ -663,8 +720,18 @@ public class RAJobController extends Controller {
         Logger.debug("Session email: " + sessionEmail);
 
         try {
+            Map<String, String[]> formUrlEncoded = request().body().asFormUrlEncoded();
+            Logger.debug("Parsed formUrlEncoded: " + formUrlEncoded);
+
+            String interviewSlot1 = sanitizeOptionalFormValue(formUrlEncoded, "interviewSlot1");
+            String interviewSlot2 = sanitizeOptionalFormValue(formUrlEncoded, "interviewSlot2");
+            String interviewSlot3 = sanitizeOptionalFormValue(formUrlEncoded, "interviewSlot3");
+
             ObjectNode jsonData = JsonNodeFactory.instance.objectNode();
             jsonData.put("status", rajobApplicationStatus);
+            jsonData.put("interviewSlot1", interviewSlot1);
+            jsonData.put("interviewSlot2", interviewSlot2);
+            jsonData.put("interviewSlot3", interviewSlot3);
 
             String statusUpdateUrl = RESTfulCalls.getBackendAPIUrl(config, Constants.RAJOB_APPLICATION_STATUS_UPDATE + rajobApplicationId);
             Logger.debug("Sending status update to: " + statusUpdateUrl);
@@ -678,12 +745,10 @@ public class RAJobController extends Controller {
                 return redirect(routes.RAJobController.rajobListPostedByUser(1));
             }
 
-            Map<String, String[]> formUrlEncoded = request().body().asFormUrlEncoded();
-            Logger.debug("Parsed formUrlEncoded: " + formUrlEncoded);
-
-            String[] ccArr = formUrlEncoded.get("ccSelected");
+            String[] ccArr = formUrlEncoded != null ? formUrlEncoded.get("ccSelected") : null;
             Logger.debug("Raw ccSelected from form: " + Arrays.toString(ccArr));
-
+            boolean sendNotif = formUrlEncoded.containsKey("sendNotif");
+            Logger.debug("sendNotif flag from form: "+ sendNotif);
             String ccString = "";
             if (ccArr != null && ccArr.length > 0 && ccArr[0] != null && !ccArr[0].isEmpty()) {
                 if (sessionEmail != null && !sessionEmail.isEmpty()) {
@@ -696,11 +761,23 @@ public class RAJobController extends Controller {
             }
             Logger.debug("Computed ccString to pass: " + ccString);
 
-            Logger.debug("▶ Calling sendOfferEmail...");
-            Result emailResult = sendOfferEmail(rajobApplicationId, ccString);
-            Logger.debug("sendOfferEmail result: " + emailResult.toString());
-
-            return emailResult;
+            //Logger.debug("▶ Calling sendOfferEmail...");
+            //Result emailResult = sendOfferEmail(rajobApplicationId, ccString, interviewSlot1, interviewSlot2, interviewSlot3);
+            //Logger.debug("sendOfferEmail result: " + emailResult.toString());
+            if (sendNotif) {
+                Logger.debug("▶ Calling sendOfferEmail...");
+                Result emailResult = sendOfferEmail(
+                        rajobApplicationId,
+                        ccString,
+                        interviewSlot1,
+                        interviewSlot2,
+                        interviewSlot3
+                );
+                Logger.debug("sendOfferEmail result: " + emailResult.toString());
+                return emailResult;
+            }
+            //return emailResult;
+            return ok(editConfirmation.render(rajobApplicationId, 0L, "RajobOffer"));
 
         } catch (Exception e) {
             Logger.error("❌ Exception caught in rajobApplicationStatusChange", e);
@@ -894,6 +971,11 @@ public class RAJobController extends Controller {
     }
 
     public Result sendOfferEmail(Long rajobApplicationId, String ccString) {
+        return sendOfferEmail(rajobApplicationId, ccString, null, null, null);
+    }
+
+    public Result sendOfferEmail(Long rajobApplicationId, String ccString,
+                                 String interviewSlot1, String interviewSlot2, String interviewSlot3) {
         checkLoginStatus();
         try {
             Logger.debug("sendOfferEmail(...) invoked. rajobApplicationId = " + rajobApplicationId
@@ -902,6 +984,9 @@ public class RAJobController extends Controller {
             ObjectNode offerData = Json.newObject();
             offerData.put("rajobApplicationId", rajobApplicationId);
             offerData.put("ccSelected", ccString);
+            offerData.put("interviewSlot1", sanitizeOptionalText(interviewSlot1));
+            offerData.put("interviewSlot2", sanitizeOptionalText(interviewSlot2));
+            offerData.put("interviewSlot3", sanitizeOptionalText(interviewSlot3));
 
             JsonNode offerResp = RESTfulCalls.postAPI(
                     RESTfulCalls.getBackendAPIUrl(config, "/rajob/offer"),
@@ -915,5 +1000,24 @@ public class RAJobController extends Controller {
             Logger.error("sendOfferEmail failed: ", e);
             return ok(editError.render("RAJobapplication"));
         }
+    }
+
+    private String sanitizeOptionalFormValue(Map<String, String[]> formData, String key) {
+        if (formData == null) {
+            return null;
+        }
+        String[] values = formData.get(key);
+        if (values == null || values.length == 0) {
+            return null;
+        }
+        return sanitizeOptionalText(values[0]);
+    }
+
+    private String sanitizeOptionalText(String value) {
+        if (value == null) {
+            return null;
+        }
+        String trimmed = value.trim();
+        return trimmed.isEmpty() ? null : trimmed;
     }
 }
